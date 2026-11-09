@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Watermark Remover</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #101418; color: #e8ecf1; padding: 16px; max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 21px; margin-bottom: 4px; }
+  .sub { color: #9fb0c3; font-size: 13px; margin-bottom: 14px; line-height: 1.5; }
+  .card { background: #171d24; border: 1px solid #26303c; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin-bottom: 10px; }
+  label { display: block; font-size: 13px; color: #9fb0c3; margin: 9px 0 4px; }
+  input[type=text], input[type=password], select { width: 100%; background: #0f141a; color: #e8ecf1; border: 1px solid #33465c; border-radius: 8px; padding: 9px 10px; font-size: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  button { background: #2374d6; color: #fff; border: 0; border-radius: 9px; padding: 11px 18px; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  button:disabled { background: #33465c; cursor: default; }
+  button.ghost { background: #223041; font-size: 13px; padding: 8px 14px; }
+  #drop { border: 2px dashed #3a4a5c; border-radius: 12px; padding: 22px 12px; text-align: center; color: #9fb0c3; cursor: pointer; }
+  #drop.over { border-color: #4da3ff; color: #cfe6ff; }
+  #drop b { color: #e8ecf1; }
+  input[type=file] { display: none; }
+  .small { font-size: 12px; color: #9fb0c3; line-height: 1.55; }
+  #steps { list-style: none; font-size: 14px; line-height: 2; display: none; }
+  #steps li::before { content: "• "; color: #9fb0c3; }
+  #steps li.run::before { content: "⏳ "; }
+  #steps li.done { color: #69d98c; } #steps li.done::before { content: "✓ "; color: #69d98c; }
+  #steps li.fail { color: #ff8080; } #steps li.fail::before { content: "✗ "; color: #ff8080; }
+  .ok { color: #69d98c; } .bad { color: #ff8080; } .warn { color: #ffd479; }
+  #result img { width: 100%; border-radius: 8px; display: block; margin-bottom: 10px; }
+  a.dl { display: inline-block; background: #2e9e5b; color: #fff; text-decoration: none; border-radius: 9px; padding: 11px 18px; font-weight: 600; margin: 4px 6px 4px 0; }
+  a.link { color: #4da3ff; }
+  details summary { cursor: pointer; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>✦ Deep Watermark Remover</h1>
+<p class="sub">Upload a Gemini image — GitHub Actions does the heavy cleaning (visible logo + deep SynthID) and the cleaned image comes back here. Your token never leaves this browser except to GitHub's own API.</p>
+
+<div class="card">
+  <details id="settingsBox">
+    <summary><b>⚙ Settings</b> <span class="small">(repo + token — saved only in this browser)</span></summary>
+    <div class="grid">
+      <div><label>GitHub username (owner)</label><input type="text" id="inOwner" placeholder="a1cva1"></div>
+      <div><label>Repo name (the one with clean.yml)</label><input type="text" id="inRepo" placeholder="watermark-cleaner"></div>
+      <div><label>Branch</label><input type="text" id="inBranch" value="main"></div>
+      <div><label>Workflow file</label><input type="text" id="inWorkflow" value="clean.yml"></div>
+    </div>
+    <label>Personal Access Token (fine-grained, only this repo: Contents + Actions = Read and write)</label>
+    <input type="password" id="inToken" placeholder="github_pat_...">
+    <button class="ghost" id="btnSave" type="button">Save settings</button>
+    <button class="ghost" id="btnTest" type="button">Test connection</button>
+    <span id="testResult" class="small"></span>
+    <p class="small warn" style="margin-top:8px">Create the token at github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Give it access to this one repo only. Never paste this token anywhere else, and never hard-code it into this page's source.</p>
+  </details>
+</div>
+
+<div class="card">
+  <h2>1. Pick an image</h2>
+  <div id="drop"><b>Tap to pick an image</b> or drop it here<br><span class="small">PNG / JPEG / WebP — one or more files</span></div>
+  <input type="file" id="file" accept="image/*" multiple>
+  <p class="small" id="fileInfo" style="margin-top:8px"></p>
+  <h2 style="margin-top:12px">2. Mode</h2>
+  <select id="selMode">
+    <option value="both" selected>Both — visible logo + deep SynthID (minutes)</option>
+    <option value="fast">Fast — visible logo + metadata only (under a minute)</option>
+    <option value="deep">Deep — SynthID regen only (minutes)</option>
+  </select>
+  <button id="btnGo" type="button">Upload &amp; clean</button>
+</div>
+
+<div class="card" id="progressCard" style="display:none">
+  <h2>Progress</h2>
+  <ul id="steps">
+    <li id="stUpload">Upload image to the repo inbox</li>
+    <li id="stDispatch">Start the cleaning workflow</li>
+    <li id="stRun">Workflow running on GitHub (deep mode takes minutes)</li>
+    <li id="stFetch">Bring the cleaned image back</li>
+  </ul>
+  <p class="small" id="runInfo"></p>
+</div>
+
+<div class="card" id="result" style="display:none">
+  <h2 class="ok">Cleaned ✓</h2>
+  <div id="resultBody"></div>
+</div>
+
+<script>
+"use strict";
+var $ = function(id){ return document.getElementById(id); };
+var API = "https://api.github.com";
+var pickedFiles = [];
+
+function cfg(){
+  return {
+    owner: $("inOwner").value.trim(),
+    repo: $("inRepo").value.trim(),
+    branch: $("inBranch").value.trim() || "main",
+    workflow: $("inWorkflow").value.trim() || "clean.yml",
+    token: $("inToken").value.trim()
+  };
+}
+function saveCfg(){
+  var c = cfg();
+  localStorage.setItem("wmr_cfg", JSON.stringify(c));
+  $("testResult").textContent = " Saved.";
+}
+function loadCfg(){
+  try {
+    var c = JSON.parse(localStorage.getItem("wmr_cfg") || "{}");
+    if (c.owner) $("inOwner").value = c.owner;
+    if (c.repo) $("inRepo").value = c.repo;
+    if (c.branch) $("inBranch").value = c.branch;
+    if (c.workflow) $("inWorkflow").value = c.workflow;
+    if (c.token) $("inToken").value = c.token;
+    if (c.owner || c.repo) $("settingsBox").removeAttribute("open");
+  } catch(e) {}
+}
+$("btnSave").addEventListener("click", saveCfg);
+
+function gh(path, opts){
+  opts = opts || {};
+  var c = cfg();
+  var headers = {
+    "Authorization": "Bearer " + c.token,
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"
+  };
+  if (opts.body) headers["Content-Type"] = "application/json";
+  return fetch(API + path, { method: opts.method || "GET", headers: headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
+    .then(function(r){
+      if (r.status === 204) return null;
+      return r.json().then(function(j){
+        if (!r.ok) throw new Error("GitHub API " + r.status + ": " + (j.message || "error"));
+        return j;
+      });
+    });
+}
+function repoPath(){ var c = cfg(); return "/repos/" + c.owner + "/" + c.repo; }
+
+$("btnTest").addEventListener("click", function(){
+  var c = cfg();
+  $("testResult").textContent = " Testing...";
+  if (!c.owner || !c.repo || !c.token){ $("testResult").innerHTML = ' <span class="bad">Fill owner, repo and token first.</span>'; return; }
+  gh(repoPath()).then(function(j){
+    $("testResult").innerHTML = ' <span class="ok">Connected: ' + j.full_name + ' (' + (j.private ? "private" : "public") + ')</span>';
+    saveCfg();
+  }).catch(function(e){ $("testResult").innerHTML = ' <span class="bad">' + e.message + '</span>'; });
+});
+
+/* ---------- file picking ---------- */
+var drop = $("drop");
+drop.addEventListener("click", function(){ $("file").click(); });
+drop.addEventListener("dragover", function(e){ e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", function(){ drop.classList.remove("over"); });
+drop.addEventListener("drop", function(e){ e.preventDefault(); drop.classList.remove("over"); setFiles(e.dataTransfer.files); });
+$("file").addEventListener("change", function(){ setFiles($("file").files); });
+function setFiles(fl){
+  pickedFiles = Array.prototype.slice.call(fl || []);
+  $("fileInfo").textContent = pickedFiles.length
+    ? pickedFiles.map(function(f){ return f.name + " (" + (f.size/1024).toFixed(0) + " KB)"; }).join(", ")
+    : "";
+}
+
+/* ---------- helpers ---------- */
+function fileToBase64(f){
+  return new Promise(function(res, rej){
+    var r = new FileReader();
+    r.onload = function(){
+      var s = String(r.result);
+      res(s.substring(s.indexOf(",") + 1));
+    };
+    r.onerror = rej;
+    r.readAsDataURL(f);
+  });
+}
+function b64ToBlob(b64, mime){
+  var bin = atob(b64), len = bin.length, arr = new Uint8Array(len);
+  for (var i = 0; i < len; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+function mimeOf(name){
+  var n = name.toLowerCase();
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+function step(id, state){
+  var el = $(id);
+  el.className = state || "";
+}
+function sleep(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
+
+function uploadFile(f){
+  var c = cfg();
+  var headSha = null, treeSha = null;
+  return fileToBase64(f).then(function(b64){
+    return gh(repoPath() + "/git/ref/heads/" + c.branch)
+      .then(function(ref){ headSha = ref.object.sha; return gh(repoPath() + "/git/commits/" + headSha); })
+      .then(function(commit){ treeSha = commit.tree.sha; return gh(repoPath() + "/git/blobs", { method: "POST", body: { content: b64, encoding: "base64" } }); })
+      .then(function(blob){
+        return gh(repoPath() + "/git/trees", { method: "POST", body: { base_tree: treeSha, tree: [{ path: "inbox/" + f.name, mode: "100644", type: "blob", sha: blob.sha }] } });
+      })
+      .then(function(tree){
+        return gh(repoPath() + "/git/commits", { method: "POST", body: { message: "Add image to inbox: " + f.name, tree: tree.sha, parents: [headSha] } });
+      })
+      .then(function(newCommit){
+        return gh(repoPath() + "/git/refs/heads/" + c.branch, { method: "PATCH", body: { sha: newCommit.sha } });
+      });
+  });
+}
+
+/* ---------- workflow: dispatch + watch ---------- */
+function dispatch(mode, fileName){
+  var c = cfg();
+  var inputs = { mode: mode };
+  if (fileName) inputs.file = fileName;
+  return gh(repoPath() + "/actions/workflows/" + encodeURIComponent(c.workflow) + "/dispatches",
+    { method: "POST", body: { ref: c.branch, inputs: inputs } });
+}
+function findRun(sinceMs){
+  var c = cfg();
+  return gh(repoPath() + "/actions/workflows/" + encodeURIComponent(c.workflow) + "/runs?per_page=10").then(function(j){
+    var runs = j.workflow_runs || [];
+    for (var i = 0; i < runs.length; i++){
+      var t = new Date(runs[i].created_at).getTime();
+      if (t >= sinceMs - 15000) return runs[i];
+    }
+    return null;
+  });
+}
+function watchRun(runId){
+  return gh(repoPath() + "/actions/runs/" + runId).then(function(run){
+    if (run.status === "completed") return run;
+    $("runInfo").innerHTML = "Status: " + run.status + " — <a class='link' target='_blank' href='" + run.html_url + "'>watch it on GitHub</a>. Keep this tab open; the run continues even if you close it.";
+    return sleep(20000).then(function(){ return watchRun(runId); });
+  });
+}
+
+/* ---------- fetch a cleaned file back ---------- */
+function fetchCleaned(origName){
+  var c = cfg();
+  var dot = origName.lastIndexOf(".");
+  var base = dot > 0 ? origName.substring(0, dot) : origName;
+  var ext = dot > 0 ? origName.substring(dot) : "";
+  var cleanedName = base + "-cleaned" + ext;
+  return gh(repoPath() + "/contents/cleaned/" + encodeURIComponent(cleanedName) + "?ref=" + c.branch).then(function(meta){
+    return gh(repoPath() + "/git/blobs/" + meta.sha).then(function(blob){
+      var b = b64ToBlob(blob.content.replace(/\n/g, ""), mimeOf(cleanedName));
+      return { name: cleanedName, blob: b, url: URL.createObjectURL(b) };
+    });
+  });
+}
+
+/* ---------- main flow ---------- */
+$("btnGo").addEventListener("click", function(){
+  var c = cfg();
+  if (!c.owner || !c.repo || !c.token){ alert("Fill the Settings first (owner, repo, token)."); $("settingsBox").setAttribute("open", ""); return; }
+  if (!pickedFiles.length){ alert("Pick an image first."); return; }
+  var btn = this; btn.disabled = true;
+  $("progressCard").style.display = "block";
+  $("steps").style.display = "block";
+  $("result").style.display = "none";
+  ["stUpload","stDispatch","stRun","stFetch"].forEach(function(id){ step(id, ""); });
+  var mode = $("selMode").value;
+  var startMs = Date.now();
+  var single = pickedFiles.length === 1 ? pickedFiles[0].name : "";
+
+  step("stUpload", "run");
+  var chain = Promise.resolve();
+  pickedFiles.forEach(function(f){
+    chain = chain.then(function(){ return uploadFile(f); });
+  });
+  chain.then(function(){
+    step("stUpload", "done");
+    step("stDispatch", "run");
+    return dispatch(mode, single);
+  }).then(function(){
+    step("stDispatch", "done");
+    step("stRun", "run");
+    $("runInfo").textContent = "Waiting for the run to appear...";
+    var tries = 0;
+    var finder = function(){
+      return findRun(startMs).then(function(run){
+        if (run) return run;
+        if (++tries > 12) throw new Error("The workflow run did not appear. Check the Actions tab on GitHub.");
+        return sleep(10000).then(finder);
+      });
+    };
+    return finder();
+  }).then(function(run){
+    return watchRun(run.id).then(function(fin){
+      if (fin.conclusion !== "success"){
+        step("stRun", "fail");
+        throw new Error("The workflow finished with: " + fin.conclusion + ". Open the run on GitHub to see the log.");
+      }
+      step("stRun", "done");
+    });
+  }).then(function(){
+    step("stFetch", "run");
+    // the workflow's commit may take a few seconds to be visible
+    return sleep(6000);
+  }).then(function(){
+    var outs = [];
+    var ch = Promise.resolve();
+    pickedFiles.forEach(function(f){
+      ch = ch.then(function(){
+        return fetchCleaned(f.name).then(function(o){ outs.push(o); })
+          .catch(function(){ return sleep(8000).then(function(){ return fetchCleaned(f.name); }).then(function(o){ outs.push(o); }); });
+      });
+    });
+    return ch.then(function(){ return outs; });
+  }).then(function(outs){
+    step("stFetch", "done");
+    var body = $("resultBody");
+    body.innerHTML = "";
+    outs.forEach(function(o){
+      var img = document.createElement("img");
+      img.src = o.url; img.alt = o.name;
+      var a = document.createElement("a");
+      a.className = "dl"; a.href = o.url; a.download = o.name; a.textContent = "Download " + o.name;
+      body.appendChild(img); body.appendChild(a);
+    });
+    $("result").style.display = "block";
+    $("runInfo").textContent = "";
+    btn.disabled = false;
+  }).catch(function(e){
+    ["stUpload","stDispatch","stRun","stFetch"].forEach(function(id){
+      var el = $(id); if (el.className === "run") el.className = "fail";
+    });
+    $("runInfo").innerHTML = "<span class='bad'>" + e.message + "</span>";
+    btn.disabled = false;
+  });
+});
+
+loadCfg();
+</script>
+</body>
+</html>
