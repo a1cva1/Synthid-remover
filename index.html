@@ -13,7 +13,6 @@
   .card h2 { font-size: 15px; margin-bottom: 10px; }
   label { display: block; font-size: 13px; color: #9fb0c3; margin: 9px 0 4px; }
   input[type=text], input[type=password], select { width: 100%; background: #0f141a; color: #e8ecf1; border: 1px solid #33465c; border-radius: 8px; padding: 9px 10px; font-size: 14px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
   button { background: #2374d6; color: #fff; border: 0; border-radius: 9px; padding: 11px 18px; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 12px; }
   button:disabled { background: #33465c; cursor: default; }
   button.ghost { background: #223041; font-size: 13px; padding: 8px 14px; }
@@ -36,23 +35,19 @@
 </head>
 <body>
 <h1>✦ Deep Watermark Remover</h1>
-<p class="sub">Upload a Gemini image — GitHub Actions does the heavy cleaning (visible logo + deep SynthID) and the cleaned image comes back here. Your token never leaves this browser except to GitHub's own API.</p>
+<p class="sub">Upload a Gemini image — GitHub Actions does the heavy cleaning (visible logo + deep SynthID) and the cleaned image comes back here. The GitHub token lives in the Cloudflare Worker as a secret; this page never sees it.</p>
 
 <div class="card">
   <details id="settingsBox">
-    <summary><b>⚙ Settings</b> <span class="small">(repo + token — saved only in this browser)</span></summary>
-    <div class="grid">
-      <div><label>GitHub username (owner)</label><input type="text" id="inOwner" placeholder="a1cva1"></div>
-      <div><label>Repo name (the one with clean.yml)</label><input type="text" id="inRepo" placeholder="watermark-cleaner"></div>
-      <div><label>Branch</label><input type="text" id="inBranch" value="main"></div>
-      <div><label>Workflow file</label><input type="text" id="inWorkflow" value="clean.yml"></div>
-    </div>
-    <label>Personal Access Token (fine-grained, only this repo: Contents + Actions = Read and write)</label>
-    <input type="password" id="inToken" placeholder="github_pat_...">
+    <summary><b>⚙ Settings</b> <span class="small">(Worker address — saved only in this browser)</span></summary>
+    <label>Cloudflare Worker URL</label>
+    <input type="text" id="inWorker" placeholder="https://wmr.yourname.workers.dev">
+    <label>Access PIN (only if you set ACCESS_PIN on the Worker)</label>
+    <input type="password" id="inPin" placeholder="e.g. 483920">
     <button class="ghost" id="btnSave" type="button">Save settings</button>
     <button class="ghost" id="btnTest" type="button">Test connection</button>
     <span id="testResult" class="small"></span>
-    <p class="small warn" style="margin-top:8px">Create the token at github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Give it access to this one repo only. Never paste this token anywhere else, and never hard-code it into this page's source.</p>
+    <p class="small" style="margin-top:8px">No GitHub token belongs on this page. The token sits in the Worker's dashboard secrets; this page only knows the Worker's address and, if you set one, a short PIN.</p>
   </details>
 </div>
 
@@ -73,7 +68,7 @@
 <div class="card" id="progressCard" style="display:none">
   <h2>Progress</h2>
   <ul id="steps">
-    <li id="stUpload">Upload image to the repo inbox</li>
+    <li id="stUpload">Upload image to the repo inbox (via the Worker)</li>
     <li id="stDispatch">Start the cleaning workflow</li>
     <li id="stRun">Workflow running on GitHub (deep mode takes minutes)</li>
     <li id="stFetch">Bring the cleaned image back</li>
@@ -89,63 +84,52 @@
 <script>
 "use strict";
 var $ = function(id){ return document.getElementById(id); };
-var API = "https://api.github.com";
 var pickedFiles = [];
 
 function cfg(){
   return {
-    owner: $("inOwner").value.trim(),
-    repo: $("inRepo").value.trim(),
-    branch: $("inBranch").value.trim() || "main",
-    workflow: $("inWorkflow").value.trim() || "clean.yml",
-    token: $("inToken").value.trim()
+    worker: $("inWorker").value.trim().replace(/\/+$/, ""),
+    pin: $("inPin").value.trim()
   };
 }
 function saveCfg(){
-  var c = cfg();
-  localStorage.setItem("wmr_cfg", JSON.stringify(c));
+  localStorage.setItem("wmr_cfg2", JSON.stringify(cfg()));
   $("testResult").textContent = " Saved.";
 }
 function loadCfg(){
   try {
-    var c = JSON.parse(localStorage.getItem("wmr_cfg") || "{}");
-    if (c.owner) $("inOwner").value = c.owner;
-    if (c.repo) $("inRepo").value = c.repo;
-    if (c.branch) $("inBranch").value = c.branch;
-    if (c.workflow) $("inWorkflow").value = c.workflow;
-    if (c.token) $("inToken").value = c.token;
-    if (c.owner || c.repo) $("settingsBox").removeAttribute("open");
-  } catch(e) {}
+    var c = JSON.parse(localStorage.getItem("wmr_cfg2") || "{}");
+    if (c.worker) $("inWorker").value = c.worker;
+    if (c.pin) $("inPin").value = c.pin;
+    if (c.worker) $("settingsBox").removeAttribute("open"); else $("settingsBox").setAttribute("open", "");
+  } catch(e) { $("settingsBox").setAttribute("open", ""); }
 }
 $("btnSave").addEventListener("click", saveCfg);
 
-function gh(path, opts){
+function wapi(path, opts){
   opts = opts || {};
   var c = cfg();
-  var headers = {
-    "Authorization": "Bearer " + c.token,
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28"
-  };
-  if (opts.body) headers["Content-Type"] = "application/json";
-  return fetch(API + path, { method: opts.method || "GET", headers: headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
-    .then(function(r){
-      if (r.status === 204) return null;
-      return r.json().then(function(j){
-        if (!r.ok) throw new Error("GitHub API " + r.status + ": " + (j.message || "error"));
-        return j;
-      });
+  var headers = { "Content-Type": "application/json" };
+  if (c.pin) headers["X-Access-Pin"] = c.pin;
+  return fetch(c.worker + path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  }).then(function(r){
+    return r.json().then(function(j){
+      if (!r.ok) throw new Error((j && j.error) || ("Worker error " + r.status));
+      return j;
     });
+  });
 }
-function repoPath(){ var c = cfg(); return "/repos/" + c.owner + "/" + c.repo; }
 
 $("btnTest").addEventListener("click", function(){
   var c = cfg();
+  if (!c.worker){ $("testResult").innerHTML = ' <span class="bad">Paste the Worker URL first.</span>'; return; }
   $("testResult").textContent = " Testing...";
-  if (!c.owner || !c.repo || !c.token){ $("testResult").innerHTML = ' <span class="bad">Fill owner, repo and token first.</span>'; return; }
-  gh(repoPath()).then(function(j){
-    $("testResult").innerHTML = ' <span class="ok">Connected: ' + j.full_name + ' (' + (j.private ? "private" : "public") + ')</span>';
-    saveCfg();
+  wapi("/api/health").then(function(j){
+    if (j.ok){ $("testResult").innerHTML = ' <span class="ok">Worker up, token set, repo: ' + j.repo + '</span>'; saveCfg(); }
+    else $("testResult").innerHTML = ' <span class="bad">Worker up but missing variables: ' + (j.missing || []).join(", ") + '</span>';
   }).catch(function(e){ $("testResult").innerHTML = ' <span class="bad">' + e.message + '</span>'; });
 });
 
@@ -167,96 +151,57 @@ function setFiles(fl){
 function fileToBase64(f){
   return new Promise(function(res, rej){
     var r = new FileReader();
-    r.onload = function(){
-      var s = String(r.result);
-      res(s.substring(s.indexOf(",") + 1));
-    };
+    r.onload = function(){ var s = String(r.result); res(s.substring(s.indexOf(",") + 1)); };
     r.onerror = rej;
     r.readAsDataURL(f);
   });
 }
-function b64ToBlob(b64, mime){
-  var bin = atob(b64), len = bin.length, arr = new Uint8Array(len);
-  for (var i = 0; i < len; i++) arr[i] = bin.charCodeAt(i);
-  return new Blob([arr], { type: mime });
-}
-function mimeOf(name){
-  var n = name.toLowerCase();
-  if (n.endsWith(".png")) return "image/png";
-  if (n.endsWith(".webp")) return "image/webp";
-  return "image/jpeg";
-}
-function step(id, state){
-  var el = $(id);
-  el.className = state || "";
-}
+function step(id, state){ $(id).className = state || ""; }
 function sleep(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
 
+/* ---------- worker calls ---------- */
 function uploadFile(f){
-  var c = cfg();
-  var headSha = null, treeSha = null;
   return fileToBase64(f).then(function(b64){
-    return gh(repoPath() + "/git/ref/heads/" + c.branch)
-      .then(function(ref){ headSha = ref.object.sha; return gh(repoPath() + "/git/commits/" + headSha); })
-      .then(function(commit){ treeSha = commit.tree.sha; return gh(repoPath() + "/git/blobs", { method: "POST", body: { content: b64, encoding: "base64" } }); })
-      .then(function(blob){
-        return gh(repoPath() + "/git/trees", { method: "POST", body: { base_tree: treeSha, tree: [{ path: "inbox/" + f.name, mode: "100644", type: "blob", sha: blob.sha }] } });
-      })
-      .then(function(tree){
-        return gh(repoPath() + "/git/commits", { method: "POST", body: { message: "Add image to inbox: " + f.name, tree: tree.sha, parents: [headSha] } });
-      })
-      .then(function(newCommit){
-        return gh(repoPath() + "/git/refs/heads/" + c.branch, { method: "PATCH", body: { sha: newCommit.sha } });
-      });
+    return wapi("/api/upload", { method: "POST", body: { name: f.name, content_b64: b64 } });
   });
 }
-
-/* ---------- workflow: dispatch + watch ---------- */
 function dispatch(mode, fileName){
-  var c = cfg();
-  var inputs = { mode: mode };
-  if (fileName) inputs.file = fileName;
-  return gh(repoPath() + "/actions/workflows/" + encodeURIComponent(c.workflow) + "/dispatches",
-    { method: "POST", body: { ref: c.branch, inputs: inputs } });
+  var body = { mode: mode };
+  if (fileName) body.file = fileName;
+  return wapi("/api/dispatch", { method: "POST", body: body });
 }
 function findRun(sinceMs){
-  var c = cfg();
-  return gh(repoPath() + "/actions/workflows/" + encodeURIComponent(c.workflow) + "/runs?per_page=10").then(function(j){
-    var runs = j.workflow_runs || [];
+  return wapi("/api/runs").then(function(j){
+    var runs = j.runs || [];
     for (var i = 0; i < runs.length; i++){
-      var t = new Date(runs[i].created_at).getTime();
-      if (t >= sinceMs - 15000) return runs[i];
+      if (new Date(runs[i].created_at).getTime() >= sinceMs - 15000) return runs[i];
     }
     return null;
   });
 }
 function watchRun(runId){
-  return gh(repoPath() + "/actions/runs/" + runId).then(function(run){
+  return wapi("/api/run?id=" + encodeURIComponent(runId)).then(function(run){
     if (run.status === "completed") return run;
     $("runInfo").innerHTML = "Status: " + run.status + " — <a class='link' target='_blank' href='" + run.html_url + "'>watch it on GitHub</a>. Keep this tab open; the run continues even if you close it.";
     return sleep(20000).then(function(){ return watchRun(runId); });
   });
 }
-
-/* ---------- fetch a cleaned file back ---------- */
 function fetchCleaned(origName){
   var c = cfg();
-  var dot = origName.lastIndexOf(".");
-  var base = dot > 0 ? origName.substring(0, dot) : origName;
-  var ext = dot > 0 ? origName.substring(dot) : "";
-  var cleanedName = base + "-cleaned" + ext;
-  return gh(repoPath() + "/contents/cleaned/" + encodeURIComponent(cleanedName) + "?ref=" + c.branch).then(function(meta){
-    return gh(repoPath() + "/git/blobs/" + meta.sha).then(function(blob){
-      var b = b64ToBlob(blob.content.replace(/\n/g, ""), mimeOf(cleanedName));
-      return { name: cleanedName, blob: b, url: URL.createObjectURL(b) };
+  var headers = {};
+  if (c.pin) headers["X-Access-Pin"] = c.pin;
+  return fetch(c.worker + "/api/cleaned?name=" + encodeURIComponent(origName), { headers: headers })
+    .then(function(r){
+      if (!r.ok) return r.json().then(function(j){ throw new Error((j && j.error) || ("cleaned fetch " + r.status)); });
+      var name = r.headers.get("X-Cleaned-Name") || (origName.replace(/(\.[^.]+)?$/, "-cleaned$1"));
+      return r.blob().then(function(b){ return { name: name, blob: b, url: URL.createObjectURL(b) }; });
     });
-  });
 }
 
 /* ---------- main flow ---------- */
 $("btnGo").addEventListener("click", function(){
   var c = cfg();
-  if (!c.owner || !c.repo || !c.token){ alert("Fill the Settings first (owner, repo, token)."); $("settingsBox").setAttribute("open", ""); return; }
+  if (!c.worker){ alert("Set the Worker URL in Settings first."); $("settingsBox").setAttribute("open", ""); return; }
   if (!pickedFiles.length){ alert("Pick an image first."); return; }
   var btn = this; btn.disabled = true;
   $("progressCard").style.display = "block";
@@ -299,7 +244,6 @@ $("btnGo").addEventListener("click", function(){
     });
   }).then(function(){
     step("stFetch", "run");
-    // the workflow's commit may take a few seconds to be visible
     return sleep(6000);
   }).then(function(){
     var outs = [];
