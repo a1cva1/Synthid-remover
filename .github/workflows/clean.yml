@@ -85,6 +85,10 @@ jobs:
               step="$(mktemp -u)/step1.$ext"
               mkdir -p "$(dirname "$step")"
               if "$WMR" remove "$cur" -o "$step"; then
+                # NOTE: wmr remove exits 0 but writes NO output file when it
+                # finds no watermark - carry the input forward unchanged then,
+                # otherwise the synthid step gets a missing file and dies.
+                [ -f "$step" ] || cp "$cur" "$step"
                 cur="$step"
               else
                 "$WMR" metadata "$cur" || true
