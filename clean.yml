@@ -1,0 +1,128 @@
+name: Deep Watermark Remover
+
+# Manual only - never runs on push.
+# Flow: upload your image(s) into the inbox/ folder (GitHub web or app),
+# then run this workflow from the Actions tab. Cleaned images are committed
+# back into cleaned/ and the inbox copy is removed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Cleaning mode"
+        type: choice
+        options: [both, fast, deep]
+        default: both
+      file:
+        description: "Single file name inside inbox/ (blank = process all)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: watermark-clean
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v5
+
+      - name: Cache the wmr engine
+        id: cache-wmr
+        uses: actions/cache@v4
+        with:
+          path: ~/wmr-engine
+          key: wmr-engine-v1.17.1
+
+      - name: Download the wmr engine (first run only)
+        if: steps.cache-wmr.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/wmr-engine
+          curl -L -o /tmp/wmr.tar.gz "https://github.com/froggeric/gemini-watermark-and-synthid-remover/releases/download/v1.17.1/wmr-linux-x86_64.tar.gz"
+          tar xzf /tmp/wmr.tar.gz -C ~/wmr-engine --strip-components=1
+          chmod +x ~/wmr-engine/wmr
+
+      - name: Cache the SynthID models (about 7 GB, first Deep run downloads them)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/wmr
+          key: wmr-models-v1
+
+      - name: Clean the images in inbox/
+        env:
+          WMR_NO_UPDATE_CHECK: "1"
+          MODE: ${{ inputs.mode }}
+          ONLY_FILE: ${{ inputs.file }}
+        run: |
+          set -e
+          mkdir -p cleaned
+          WMR="$HOME/wmr-engine/wmr"
+          shopt -s nullglob nocaseglob
+          files=()
+          if [ -n "$ONLY_FILE" ]; then
+            files=("inbox/$ONLY_FILE")
+          else
+            files=(inbox/*.png inbox/*.jpg inbox/*.jpeg inbox/*.webp)
+          fi
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No images found in inbox/ - upload an image there first."
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || { echo "Missing file: $f"; exit 1; }
+            base="$(basename "$f")"
+            name="${base%.*}"
+            ext="${base##*.}"
+            cur="$f"
+            if [ "$MODE" = "fast" ] || [ "$MODE" = "both" ]; then
+              step="$(mktemp -u)/step1.$ext"
+              mkdir -p "$(dirname "$step")"
+              if "$WMR" remove "$cur" -o "$step"; then
+                cur="$step"
+              else
+                "$WMR" metadata "$cur" || true
+                stripped="${cur%.*}_clean.${cur##*.}"
+                [ -f "$stripped" ] && cur="$stripped"
+              fi
+            fi
+            if [ "$MODE" = "deep" ] || [ "$MODE" = "both" ]; then
+              "$WMR" synthid "$cur" -o "cleaned/${name}-cleaned.$ext" -f
+            else
+              cp "$cur" "cleaned/${name}-cleaned.$ext"
+            fi
+            echo "Cleaned: $f -> cleaned/${name}-cleaned.$ext"
+          done
+
+      - name: Upload cleaned images as an artifact (backup copy)
+        uses: actions/upload-artifact@v6
+        with:
+          name: cleaned-images
+          path: cleaned/
+          retention-days: 7
+
+      - name: Commit cleaned images and clear the inbox
+        env:
+          MODE: ${{ inputs.mode }}
+          ONLY_FILE: ${{ inputs.file }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cleaned/
+          if [ -n "$ONLY_FILE" ]; then
+            git rm -q --ignore-unmatch "inbox/$ONLY_FILE"
+          else
+            git rm -q --ignore-unmatch inbox/*.png inbox/*.jpg inbox/*.jpeg inbox/*.webp 2>/dev/null || true
+          fi
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Cleaned images (mode: $MODE)"
+            git push
+          fi
